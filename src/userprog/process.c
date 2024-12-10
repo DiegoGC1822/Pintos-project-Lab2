@@ -17,203 +17,9 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "lib/kernel/hash.h"
-#include "devices/block.h"
-#include "threads/vaddr.h"
-#include "threads/synch.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
-
-struct swap_table swap_table;
-
-void swap_table_init(void) {
-    // Obtiene el dispositivo de swap.
-    swap_table.swap_device = block_get_role(BLOCK_SWAP);
-    if (!swap_table.swap_device) {
-        PANIC("No swap device found!");
-    }
-
-    // Calcula la cantidad de slots de swap disponibles.
-    size_t swap_size = block_size(swap_table.swap_device) / (PGSIZE / BLOCK_SECTOR_SIZE);
-    swap_table.swap_slots = bitmap_create(swap_size);
-    if (!swap_table.swap_slots) {
-        PANIC("Failed to initialize swap table!");
-    }
-
-    bitmap_set_all(swap_table.swap_slots, false); // Marca todos los slots como libres.
-}
-
-size_t write_to_swap(void *kpage) {
-    // Encuentra un slot libre en el mapa de bits.
-    size_t swap_index = bitmap_scan_and_flip(swap_table.swap_slots, 0, 1, false);
-    if (swap_index == BITMAP_ERROR) {
-        PANIC("Swap space full!");
-    }
-
-    // Escribe la página en el dispositivo de swap.
-    for (size_t i = 0; i < PGSIZE / BLOCK_SECTOR_SIZE; i++) {
-        block_write(swap_table.swap_device, swap_index * (PGSIZE / BLOCK_SECTOR_SIZE) + i,
-                    kpage + i * BLOCK_SECTOR_SIZE);
-    }
-
-    return swap_index;
-}
-
-void read_from_swap(size_t swap_index, void *kpage) {
-    // Lee la página desde el dispositivo de swap.
-    for (size_t i = 0; i < PGSIZE / BLOCK_SECTOR_SIZE; i++) {
-        block_read(swap_table.swap_device, swap_index * (PGSIZE / BLOCK_SECTOR_SIZE) + i,
-                   kpage + i * BLOCK_SECTOR_SIZE);
-    }
-
-    // Marca el slot como libre.
-    bitmap_set(swap_table.swap_slots, swap_index, false);
-}
-
-void free_swap_slot(size_t swap_index) {
-    ASSERT(bitmap_test(swap_table.swap_slots, swap_index));
-    bitmap_set(swap_table.swap_slots, swap_index, false);
-}
-
-struct list frame_table;
-static struct lock frame_table_lock;
-
-void frame_table_init(void) {
-    list_init(&frame_table);
-    lock_init(&frame_table_lock); // Inicializa el lock
-}
-
-void *get_frame(void *upage, bool writable) {
-    lock_acquire(&frame_table_lock);  // Adquiere el lock antes de modificar la tabla
-    void *frame = palloc_get_page(PAL_USER);
-    if (frame != NULL) {
-        // Registro del nuevo marco.
-        struct frame *f = malloc(sizeof(struct frame));
-        f->kpage = frame;
-        f->owner = thread_current();
-        f->upage = upage;
-        list_push_back(&frame_table, &f->elem);
-        lock_release(&frame_table_lock);  // Libera el lock después de modificar
-        return frame;
-    }
-
-    // Si no hay marcos libres, invocamos reemplazo.
-    void *evicted_frame = evict_frame(upage, writable);
-    lock_release(&frame_table_lock);  // Libera el lock
-    return evicted_frame;
-}
-
-void release_frame(void *kpage) {
-    lock_acquire(&frame_table_lock);  // Adquiere el lock antes de liberar el frame
-    struct list_elem *e = list_begin(&frame_table);
-    while (e != list_end(&frame_table)) {
-        struct frame *f = list_entry(e, struct frame, elem);
-        if (f->kpage == kpage) {
-            list_remove(e);
-            free(f);
-            palloc_free_page(kpage);
-            lock_release(&frame_table_lock);  // Libera el lock
-            return;
-        }
-        e = list_next(e);
-    }
-    lock_release(&frame_table_lock);  // Libera el lock si no se encontró el frame
-}
-
-void *evict_frame(void *upage, bool writable) {
-    struct list_elem *e = list_begin(&frame_table);
-
-    while (e != list_end(&frame_table)) {
-        struct frame *f = list_entry(e, struct frame, elem);
-
-        if (!pagedir_is_accessed(f->owner->pagedir, f->upage)) {
-            if (pagedir_is_dirty(f->owner->pagedir, f->upage)) {
-                size_t swap_index = write_to_swap(f->kpage);
-                struct suppl_page *sp = find_supp_page(&f->owner->suppl_page_table, f->upage);
-                sp->location = PAGE_SWAP;
-                sp->swap_index = swap_index;
-            }
-
-            pagedir_clear_page(f->owner->pagedir, f->upage);
-            void *frame = f->kpage;
-            list_remove(e);
-            free(f);
-            return frame;
-        }
-
-        pagedir_set_accessed(f->owner->pagedir, f->upage, false);
-        e = list_next(e);
-    }
-
-    PANIC("No frames available and swap is full!");
-}
-
-static struct lock suppl_page_table_lock;
-
-unsigned suppl_page_hash(const struct hash_elem *e, void *aux) {
-    struct suppl_page *sp = hash_entry(e, struct suppl_page, elem);
-    return hash_bytes(&sp->upage, sizeof sp->upage);
-}
-
-bool suppl_page_less(const struct hash_elem *a, const struct hash_elem *b, void *aux) {
-    struct suppl_page *spa = hash_entry(a, struct suppl_page, elem);
-    struct suppl_page *spb = hash_entry(b, struct suppl_page, elem);
-    return spa->upage < spb->upage;
-}
-
-bool add_supp_page(struct hash *table, void *upage, struct file *file, off_t ofs, 
-                   size_t page_read_bytes, size_t page_zero_bytes, bool writable) {
-    lock_acquire(&suppl_page_table_lock);  // Adquiere el lock
-
-    struct suppl_page *sp = malloc(sizeof(struct suppl_page));
-    if (sp == NULL) {
-        lock_release(&suppl_page_table_lock);  // Libera el lock si hay un error
-        return false;
-    }
-
-    sp->upage = upage;
-    sp->file = file;
-    sp->ofs = ofs;
-    sp->read_bytes = page_read_bytes;
-    sp->zero_bytes = page_zero_bytes;
-    sp->writable = writable;
-    sp->location = (page_read_bytes == 0) ? PAGE_ZERO : PAGE_FILE;
-
-    struct hash_elem *result = hash_insert(table, &sp->elem);
-    if (result != NULL) {
-        free(sp);  // Libera memoria si ya existía un registro
-        lock_release(&suppl_page_table_lock);  // Libera el lock
-        return false;
-    }
-
-    lock_release(&suppl_page_table_lock);  // Libera el lock
-    return true;
-}
-
-
-struct suppl_page *find_supp_page(struct hash *table, void *upage) {
-    struct suppl_page temp;
-    temp.upage = upage;
-    struct hash_elem *e = hash_find(table, &temp.elem);
-    return e ? hash_entry(e, struct suppl_page, elem) : NULL;
-}
-
-void free_supp_page(struct hash_elem *e, void *aux) {
-    struct suppl_page *sp = hash_entry(e, struct suppl_page, elem);
-    free(sp); // Libera la estructura.
-}
-
-void free_supp_page_table(struct hash *table) {
-    hash_destroy(table, free_supp_page);
-}
-
-
-void suppl_page_table_init(struct hash *table) {
-    lock_init(&suppl_page_table_lock);  // Inicializa el lock
-    hash_init(table, suppl_page_hash, suppl_page_less, NULL);
-}
-
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -286,22 +92,29 @@ process_wait (tid_t child_tid UNUSED)
 }
 
 /* Free the current process's resources. */
-void process_exit(void) {
-    struct thread *cur = thread_current();
-    struct hash *table = &cur->suppl_page_table;
+void
+process_exit (void)
+{
+  struct thread *cur = thread_current ();
+  uint32_t *pd;
 
-    struct hash_iterator i;
-    hash_first(&i, table);
-    while (hash_next(&i)) {
-        struct suppl_page *sp = hash_entry(hash_cur(&i), struct suppl_page, elem);
-        if (sp->location == PAGE_SWAP) {
-            free_swap_slot(sp->swap_index);
-        }
+  /* Destroy the current process's page directory and switch back
+     to the kernel-only page directory. */
+  pd = cur->pagedir;
+  if (pd != NULL) 
+    {
+      /* Correct ordering here is crucial.  We must set
+         cur->pagedir to NULL before switching page directories,
+         so that a timer interrupt can't switch back to the
+         process page directory.  We must activate the base page
+         directory before destroying the process's page
+         directory, or our active page directory will be one
+         that's been freed (and cleared). */
+      cur->pagedir = NULL;
+      pagedir_activate (NULL);
+      pagedir_destroy (pd);
     }
-
-    free_supp_page_table(table);
 }
-
 
 /* Sets up the CPU for running user code in the current
    thread.
@@ -318,6 +131,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -501,7 +315,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   file_close (file);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -551,34 +365,64 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
+/* Loads a segment starting at offset OFS in FILE at address
+   UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
+   memory are initialized, as follows:
+
+        - READ_BYTES bytes at UPAGE must be read from FILE
+          starting at offset OFS.
+
+        - ZERO_BYTES bytes at UPAGE + READ_BYTES must be zeroed.
+
+   The pages initialized by this function must be writable by the
+   user process if WRITABLE is true, read-only otherwise.
+
+   Return true if successful, false if a memory allocation error
+   or disk read error occurs. */
 static bool
-load_segment(struct file *file, off_t ofs, uint8_t *upage,
-             uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
+load_segment (struct file *file, off_t ofs, uint8_t *upage,
+              uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
 {
-    ASSERT((read_bytes + zero_bytes) % PGSIZE == 0);
-    ASSERT(pg_ofs(upage) == 0);
+  ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
+  ASSERT (pg_ofs (upage) == 0);
+  ASSERT (ofs % PGSIZE == 0);
 
-    while (read_bytes > 0 || zero_bytes > 0) 
+  file_seek (file, ofs);
+  while (read_bytes > 0 || zero_bytes > 0) 
     {
-        size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-        size_t page_zero_bytes = PGSIZE - page_read_bytes;
+      /* Calculate how to fill this page.
+         We will read PAGE_READ_BYTES bytes from FILE
+         and zero the final PAGE_ZERO_BYTES bytes. */
+      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+      size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-        /* Registrar en la tabla suplementaria. */
-        if (!add_supp_page(&thread_current()->suppl_page_table, upage, file, ofs, 
-                           page_read_bytes, page_zero_bytes, writable)) {
-            return false;
+      /* Get a page of memory. */
+      uint8_t *kpage = palloc_get_page (PAL_USER);
+      if (kpage == NULL)
+        return false;
+
+      /* Load this page. */
+      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+        {
+          palloc_free_page (kpage);
+          return false; 
+        }
+      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+      /* Add the page to the process's address space. */
+      if (!install_page (upage, kpage, writable)) 
+        {
+          palloc_free_page (kpage);
+          return false; 
         }
 
-        /* Avanzar a la siguiente página. */
-        read_bytes -= page_read_bytes;
-        zero_bytes -= page_zero_bytes;
-        ofs += page_read_bytes;
-        upage += PGSIZE;
+      /* Advance. */
+      read_bytes -= page_read_bytes;
+      zero_bytes -= page_zero_bytes;
+      upage += PGSIZE;
     }
-    return true;
+  return true;
 }
-
-
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
